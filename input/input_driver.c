@@ -1807,12 +1807,134 @@ static int16_t input_overlay_pointing_device_state(
 #endif
 
 #if defined(HAVE_NETWORKING) && defined(HAVE_NETWORKGAMEPAD)
-static bool input_remote_init_network(input_remote_t *handle,
+
+/*
+ * Remote RetroPad networking
+ * --------------------------
+ *
+ * Remote RetroPad uses UDP delta messages: each datagram changes one button
+ * or one analog axis; a datagram is not a complete controller snapshot.
+ *
+ * The previous receiver consumed only one datagram per user per frontend
+ * poll. When the sender produced updates faster than the emulation frame
+ * rate, stale packets accumulated in the socket receive queue. Every input
+ * event then had to wait behind older events, producing the increasing
+ * latency/backlog seen most clearly with analog sticks and simultaneous
+ * controls.
+ *
+ * The receiver below drains each nonblocking socket until it is empty on
+ * every poll. All queued deltas are still applied in order, so no button or
+ * axis transition is skipped, but RetroArch finishes each poll at the newest
+ * state available instead of intentionally leaving stale input queued.
+ *
+ * A second important fix is the empty-socket path. On Windows/Winsock,
+ * nonblocking recvfrom() reports WSAEWOULDBLOCK through WSAGetLastError().
+ * "No packet waiting" means "controller state did not change"; it must not
+ * be interpreted as "release all buttons / centre all sticks".
+ *
+ * This is intentionally a small, local change. It keeps the XboxEmulationHub
+ * input driver and surrounding headers/API untouched.
+ */
+
+static bool input_remote_socket_valid(
+      const input_remote_t *handle, unsigned user)
+{
+   if (!handle || user >= MAX_USERS)
+      return false;
+
+#ifdef _WIN32
+   return handle->net_fd[user] != INVALID_SOCKET;
+#else
+   return handle->net_fd[user] >= 0;
+#endif
+}
+
+static void input_remote_clear_user_state(
+      input_remote_state_t *input_state, unsigned user)
+{
+   if (!input_state || user >= MAX_USERS)
+      return;
+
+   input_state->buttons[user]   = 0;
+   input_state->analog[0][user] = 0;
+   input_state->analog[1][user] = 0;
+   input_state->analog[2][user] = 0;
+   input_state->analog[3][user] = 0;
+}
+
+static void input_remote_parse_packet(
+      input_remote_state_t *input_state,
+      const struct remote_message *msg,
+      unsigned user)
+{
+   if (!input_state || !msg || user >= MAX_USERS)
+      return;
+
+   switch (msg->device)
+   {
+      case RETRO_DEVICE_JOYPAD:
+         /*
+          * id is signed in struct remote_message. Check both bounds before
+          * shifting: a negative shift is undefined behaviour.
+          */
+         if (msg->id >= 0 && msg->id < 16)
+         {
+            uint64_t mask = UINT64_C(1) << (unsigned)msg->id;
+
+            input_state->buttons[user] &= ~mask;
+            if (msg->state)
+               input_state->buttons[user] |= mask;
+         }
+         break;
+
+      case RETRO_DEVICE_ANALOG:
+         /*
+          * index/id are also signed. Validate them before indexing the
+          * [4][MAX_USERS] analog-state array.
+          */
+         if (     msg->id    >= 0
+               && msg->id    < 2
+               && msg->index >= 0
+               && msg->index < 2)
+         {
+            /*
+             * The protocol stores axis bits in uint16_t, while RetroArch
+             * consumes a signed int16_t. Convert explicitly so 0x8000..ffff
+             * become -32768..-1 without relying on implementation-defined
+             * unsigned-to-signed conversion.
+             */
+            int32_t analog_state = (int32_t)msg->state;
+
+            if (analog_state & 0x8000)
+               analog_state -= 0x10000;
+
+            input_state->analog[msg->index * 2 + msg->id][user] =
+                  (int16_t)analog_state;
+         }
+         break;
+
+      default:
+         /* Unknown device packets do not alter the last valid controller
+          * state. */
+         break;
+   }
+}
+
+static bool input_remote_init_network(
+      input_remote_t *handle,
       uint16_t port, unsigned user)
 {
    int fd;
-   struct addrinfo *res  = NULL;
-   port                  = port + user;
+   struct addrinfo *res = NULL;
+
+   if (!handle || user >= MAX_USERS)
+      return false;
+
+   /* Each user gets base_port + user. Reject uint16_t wraparound. */
+   if ((unsigned)port + user > 0xffffU)
+      return false;
+
+   port = (uint16_t)((unsigned)port + user);
 
    if (!network_init())
       return false;
@@ -1820,7 +1942,10 @@ static bool input_remote_init_network(input_remote_t *handle,
    RARCH_LOG("[Network] Bringing up remote interface on port %hu.\n",
          (unsigned short)port);
 
-   if ((fd = socket_init((void**)&res, port, NULL, SOCKET_TYPE_DATAGRAM, AF_INET)) >= 0)
+   fd = socket_init((void**)&res, port, NULL,
+         SOCKET_TYPE_DATAGRAM, AF_INET);
+
+   if (fd >= 0)
    {
       handle->net_fd[user] = fd;
 
@@ -1831,20 +1956,148 @@ static bool input_remote_init_network(input_remote_t *handle,
             freeaddrinfo_retro(res);
             return true;
          }
+
          RARCH_ERR("%s\n", msg_hash_to_str(MSG_FAILED_TO_BIND_SOCKET));
       }
    }
 
    if (res)
       freeaddrinfo_retro(res);
+
    return false;
+}
+
+/*
+ * Drain one user's nonblocking UDP socket completely.
+ *
+ * Every exact-size packet is applied immediately, in arrival order. The loop
+ * exits only when the socket is empty or a real receive error occurs.
+ *
+ * The receive buffer is one byte larger than remote_message. On systems that
+ * report a truncated UDP datagram as the buffer size, this prevents the
+ * prefix of an oversized malformed datagram from looking like a valid packet.
+ */
+static void input_remote_drain_socket(
+      input_remote_t *handle,
+      input_remote_state_t *input_state,
+      unsigned user)
+{
+   if (!input_state || !input_remote_socket_valid(handle, user))
+      return;
+
+   for (;;)
+   {
+      unsigned char packet[sizeof(struct remote_message) + 1];
+      struct remote_message msg;
+      ssize_t ret = recvfrom(handle->net_fd[user],
+            (char*)packet, sizeof(packet), 0, NULL, NULL);
+
+      if (ret == (ssize_t)sizeof(msg))
+      {
+         memcpy(&msg, packet, sizeof(msg));
+         input_remote_parse_packet(input_state, &msg, user);
+         continue;
+      }
+
+      if (ret < 0)
+      {
+#ifdef _WIN32
+         int error = WSAGetLastError();
+
+         /* Normal termination for a fully drained nonblocking socket. */
+         if (error == WSAEWOULDBLOCK)
+            break;
+
+         /* Retry interrupted receives. WSAEMSGSIZE means an oversized
+          * datagram was truncated/consumed, so skip it and keep draining. */
+         if (error == WSAEINTR || error == WSAEMSGSIZE)
+            continue;
+#else
+         /* Normal termination for a fully drained nonblocking socket. */
+         if (errno == EAGAIN
+#ifdef EWOULDBLOCK
+               || errno == EWOULDBLOCK
+#endif
+            )
+            break;
+
+         if (errno == EINTR)
+            continue;
+#endif
+
+         /*
+          * Keep the last known good state on a genuine socket error.
+          * UDP has no useful disconnect event here; clearing state would
+          * manufacture a release/centre transition that was never received.
+          */
+         break;
+      }
+
+      /*
+       * Short, zero-length or oversized/truncated datagrams are malformed
+       * for this protocol. They have already been consumed; ignore them and
+       * continue so they cannot block valid packets behind them.
+       */
+   }
+}
+
+static void input_remote_drain_all(
+      input_remote_t *handle,
+      input_remote_state_t *input_state,
+      const settings_t *settings,
+      unsigned max_users)
+{
+   unsigned user;
+
+   if (!handle || !input_state || !settings)
+      return;
+
+   if (max_users > MAX_USERS)
+      max_users = MAX_USERS;
+
+   for (user = 0; user < max_users; user++)
+   {
+      /*
+       * If a user is disabled at runtime, release any previously latched
+       * Remote RetroPad state for that user instead of leaving stale input.
+       */
+      if (!settings->bools.network_remote_enable_user[user])
+      {
+         input_remote_clear_user_state(input_state, user);
+         continue;
+      }
+
+      input_remote_drain_socket(handle, input_state, user);
+   }
 }
 
 void input_remote_free(input_remote_t *handle, unsigned max_users)
 {
-   int user;
-   for (user = 0; user < (int)max_users; user ++)
-      socket_close(handle->net_fd[user]);
+   unsigned user;
+
+   if (!handle)
+      return;
+
+   if (max_users > MAX_USERS)
+      max_users = MAX_USERS;
+
+   for (user = 0; user < max_users; user++)
+   {
+#ifdef _WIN32
+      if (handle->net_fd[user] != INVALID_SOCKET)
+      {
+         socket_close(handle->net_fd[user]);
+         handle->net_fd[user] = INVALID_SOCKET;
+      }
+#else
+      if (handle->net_fd[user] >= 0)
+      {
+         socket_close(handle->net_fd[user]);
+         handle->net_fd[user] = -1;
+      }
+#endif
+   }
+
    free(handle);
 }
 
@@ -1852,53 +2105,54 @@ static input_remote_t *input_remote_new(
       settings_t *settings,
       uint16_t port, unsigned max_users)
 {
-   int user;
-   input_remote_t      *handle = (input_remote_t*)
-      calloc(1, sizeof(*handle));
+   unsigned user;
+   input_remote_t *handle = (input_remote_t*)calloc(1, sizeof(*handle));
 
-   if (!handle)
-      return NULL;
-
-   for (user = 0; user < (int)max_users; user++)
+   if (!handle || !settings)
    {
+      free(handle);
+      return NULL;
+   }
+
+   if (max_users > MAX_USERS)
+      max_users = MAX_USERS;
+
+   /*
+    * calloc() gives zeroes, but descriptor 0 is valid on POSIX and Winsock's
+    * INVALID_SOCKET is not zero. Initialise every descriptor explicitly so
+    * all cleanup paths are safe.
+    */
+   for (user = 0; user < MAX_USERS; user++)
+   {
+#ifdef _WIN32
+      handle->net_fd[user] = INVALID_SOCKET;
+#else
       handle->net_fd[user] = -1;
-      if (settings->bools.network_remote_enable_user[user])
-         if (!input_remote_init_network(handle, port, user))
-         {
-            input_remote_free(handle, max_users);
-            return NULL;
-         }
+#endif
+   }
+
+   for (user = 0; user < max_users; user++)
+   {
+      if (!settings->bools.network_remote_enable_user[user])
+         continue;
+
+      if (!input_remote_init_network(handle, port, user))
+      {
+         input_remote_free(handle, max_users);
+         return NULL;
+      }
    }
 
    return handle;
-}
-
-static void input_remote_parse_packet(
-      input_remote_state_t *input_state,
-      struct remote_message *msg, unsigned user)
-{
-   /* Parse message */
-   switch (msg->device)
-   {
-      case RETRO_DEVICE_JOYPAD:
-         if (msg->id < 16)
-         {
-            input_state->buttons[user] &= ~(1 << msg->id);
-            if (msg->state)
-               input_state->buttons[user] |= 1 << msg->id;
-         }
-         break;
-      case RETRO_DEVICE_ANALOG:
-         if (msg->id<2 && msg->index<2)
-            input_state->analog[msg->index * 2 + msg->id][user] = msg->state;
-         break;
-   }
 }
 
 input_remote_t *input_driver_init_remote(
       settings_t *settings,
       unsigned num_active_users)
 {
+   if (!settings)
+      return NULL;
+
    return input_remote_new(settings,
          settings->uints.network_remote_base_port,
          num_active_users);
@@ -7769,51 +8023,18 @@ void input_driver_poll(void)
    }
 #endif
 
-#ifdef HAVE_NETWORKGAMEPAD
-   /* Poll remote */
-   if (input_st->remote)
-   {
-      unsigned user;
-
-      for (user = 0; user < max_users; user++)
-      {
-         if (settings->bools.network_remote_enable_user[user])
-         {
 #if defined(HAVE_NETWORKING) && defined(HAVE_NETWORKGAMEPAD)
-            fd_set fds;
-            ssize_t ret;
-            struct remote_message msg;
-
-
-#if defined(_WIN32)
-            if (input_st->remote->net_fd[user] == INVALID_SOCKET)
-#else
-            if (input_st->remote->net_fd[user] < 0)
-#endif
-               return;
-
-            FD_ZERO(&fds);
-            FD_SET(input_st->remote->net_fd[user], &fds);
-
-            ret = recvfrom(input_st->remote->net_fd[user],
-                  (char*)&msg,
-                  sizeof(msg), 0, NULL, NULL);
-
-            if (ret == sizeof(msg))
-               input_remote_parse_packet(&input_st->remote_st_ptr, &msg, user);
-            else if ((ret != -1) || ((errno != EAGAIN) && (errno != ENOENT)))
-#endif
-            {
-               input_remote_state_t *input_state  = &input_st->remote_st_ptr;
-               input_state->buttons[user]         = 0;
-               input_state->analog[0][user]       = 0;
-               input_state->analog[1][user]       = 0;
-               input_state->analog[2][user]       = 0;
-               input_state->analog[3][user]       = 0;
-            }
-         }
-      }
-   }
+   /*
+    * Consume every queued Remote RetroPad delta before exposing state to the
+    * core. This keeps the UDP receive queue empty instead of advancing by one
+    * stale packet per frame.
+    */
+   if (input_st->remote)
+      input_remote_drain_all(
+            input_st->remote,
+            &input_st->remote_st_ptr,
+            settings,
+            max_users);
 #endif
 #ifdef HAVE_BSV_MOVIE
    if (BSV_MOVIE_IS_PLAYBACK_ON())
